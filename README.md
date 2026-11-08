@@ -18,7 +18,8 @@
 
 **Auto-Seedbox-PT** 是一个高度智能化的 Shell 脚本，旨在彻底简化 PT 专用服务器（Seedbox）的部署流程。它不仅能一键安装 qBittorrent、Vertex 和 FileBrowser，更内置了极其硬核的**系统级内核调优引擎**。
 
-专注于 **刷流峰值** 与 **系统稳定** 的平衡：支持 **v4/v5**、**Mode 1/2**、**SSD/HDD** 自适配，并可选启用 **Mode 1 运行时动态控制器（`-a`）**。
+专注于 **刷流峰值** 与 **系统稳定** 的平衡：支持 **v4/v5**、**Mode 1/2**、**SSD/HDD** 自适配，并可选启用 **Mode 1 运行时动态控制器（`-a`）**。  
+支持可选部署 **第二个 qBittorrent 实例**（`-Q 2`），便于分站点、分任务或分磁盘刷流。
 
 支持架构：**x86_64 / arm64 / armv7（32 位 ARM）**，内置 `4.3.9` 与 `5.0.4` 对应静态二进制。
 
@@ -49,6 +50,13 @@
 ### 📦 组件化部署
 - **Vertex**（Docker）：支持备份恢复与配置清洗（自动修正 qB 地址与账号密码）。
 - **FileBrowser + MediaInfo**（Docker + Nginx）：网页内可直接查看媒体信息以及进行视频智能截图（发种专用，本地微服务 + Nginx 注入）。
+
+### 🧩 可选双 qBittorrent 实例（`-Q 2`）
+- 安装时可选择部署 **1 个** 或 **2 个** qBittorrent 实例，未指定参数时交互询问，默认 1 个。
+- 第二实例使用 **独立配置目录**（`~/.config/qbittorrent-2`）与 **独立 BT_backup**（`~/.local/share/qbittorrent-2`），与第一实例互不干扰。
+- 两个实例 **共用 `~/Downloads` 下载目录**，可分别连接不同站点或分别控制任务。
+- 第二实例默认端口：WebUI `8880`、BT `47879`，可用 `-o` 自定义，并自动完成端口冲突检查与防火墙放行。
+- 自动缓存分档时，双实例会按实例均分（最低 256 MiB）；显式 `-c` 则两个实例分别使用该值。
 
 ---
 
@@ -92,6 +100,13 @@ bash <(wget -qO- https://raw.githubusercontent.com/kin-w/Auto-Seedbox-PT/main/au
  -u 用户名 -p '密码' -v -d '备份直链' -k '解压密码' -f -r /data/downloads -o
 ```
 
+### 7) 双 qBittorrent 实例（分站点/分任务）
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/kin-w/Auto-Seedbox-PT/main/auto_seedbox_pt.sh) \
+  -u 用户名 -p 密码 -q 5 -m 1 -v -f -t -Q 2
+```
+> 不加 `-Q` 时默认安装 1 个实例；交互终端下会在安装前询问一次。
+
 ---
 
 ## <a id="parameters"></a>📝 参数详解
@@ -102,7 +117,8 @@ bash <(wget -qO- https://raw.githubusercontent.com/kin-w/Auto-Seedbox-PT/main/au
 | `-p` | ✅ | 统一密码（必须 ≥ 12 位） | `-p mysecurepass` |
 | `-m` | ⭕ | 模式：`1`(极限刷流) / `2`(均衡保种)，默认 `1` | `-m 1` |
 | `-q` | ⭕ | qB 版本：`4.3.9`、`5`、`latest` 或指定版本 | `-q 5.0.4` |
-| `-c` | ⭕ | 指定缓存/工作集 (MiB)，不填则自动分档 | `-c 2048` |
+| `-Q` | ⭕ | qB 实例数量：`1` 或 `2`，默认 `1`；第二实例独立配置与 BT_backup，共用 Downloads | `-Q 2` |
+| `-c` | ⭕ | 指定缓存/工作集 (MiB)，不填则自动分档（双实例时自动按实例均分） | `-c 2048` |
 | `-t` | ⭕ | 启用系统级内核与网络调优 | `-t` |
 | `-a` | ⭕ | 启用 Mode 1 动态控制器（仅 `-m 1` 生效） | `-a` |
 | `-v` | ⭕ | 部署 Vertex (Docker) | `-v` |
@@ -116,7 +132,7 @@ bash <(wget -qO- https://raw.githubusercontent.com/kin-w/Auto-Seedbox-PT/main/au
 
 ## <a id="uninstall"></a>🗑️ 卸载与清理
 
-> `--uninstall` 会清理服务/容器/配置，并回滚 sysctl、limits、扩展服务与相关规则（可交互选择是否删除 Downloads 数据目录）。
+> `--uninstall` 会清理服务/容器/配置，并回滚 sysctl、limits、扩展服务与相关规则（可交互选择是否删除 Downloads 数据目录）。若曾使用 `-Q 2` 安装，会同时移除第二实例的服务、配置目录与 BT_backup。
 
 ```bash
 bash <(wget -qO- https://raw.githubusercontent.com/kin-w/Auto-Seedbox-PT/main/auto_seedbox_pt.sh) --uninstall
@@ -194,6 +210,22 @@ A: 脚本仅在系统已具备相关拥塞算法时启用，不强制更换内�
 
 **Q: 为什么 `-m 1` 被降级为 `-m 2`？**  
 A: 物理内存 `<4GB` 时会触发保护降级，避免高并发下 OOM 卡死。
+
+**Q: 第二个 qBittorrent 怎么访问、怎么管理？**  
+A: 访问 `http://服务器IP:8880`（若自定义则以安装完成摘要为准），账号密码与第一个实例相同。管理命令：
+```bash
+systemctl status qbittorrent-nox-2
+systemctl restart qbittorrent-nox-2
+```
+
+**Q: 两个 qB 实例的数据会互相影响吗？**  
+A: 配置与 BT_backup 完全独立，仅共用 `~/Downloads` 下载目录。若同一资源同时加入两个实例，可能出现重复校验/同名文件占用，建议按站点或任务分开使用。
+
+**Q: Vertex 会自动连接第二个 qB 吗？**  
+A: 不会。脚本只自动配置第一个实例；第二个实例需要你在 Vertex 界面中手动添加下载器（地址填 Docker 网桥网关 + `8880`）。
+
+**Q: `-a` 动态控制器会同时调节两个实例吗？**  
+A: 不会，`-a` 仅针对第一个 qBittorrent 实例生效。
 
 **Q: Vertex 连不上 qB，127.0.0.1 不行？**  
 A: Vertex 在容器内，`127.0.0.1` 指向容器自身。应使用 Docker 网桥网关（脚本完成页会输出）。

@@ -13,6 +13,8 @@
 #        - 5.x: 作为 memory_working_set_limit 使用
 #        不传则走默认保守策略
 #   -q : qBittorrent 版本 (4, 4.3.9, 5, 5.0.4, latest, 或精确小版本如 5.1.2)
+#   -Q : qBittorrent 实例数量 (1 或 2，默认 1)
+#        第二实例使用独立配置与 BT_backup 目录，共用 Downloads 目录
 #   -v : 安装 Vertex
 #   -f : 安装 FileBrowser (含 MediaInfo 扩展)
 #   -t : 启用系统内核优化（强烈推荐）
@@ -39,6 +41,8 @@ ASP_VERSION="3.7.3"
 
 QB_WEB_PORT=8080
 QB_BT_PORT=47878
+QB2_WEB_PORT=8880
+QB2_BT_PORT=47879
 VX_PORT=3000
 FB_PORT=8081
 MI_PORT=8082
@@ -53,6 +57,8 @@ DO_VX=false
 DO_FB=false
 DO_TUNE=false
 CUSTOM_PORT=false
+QB_COUNT=1
+QB_COUNT_SET_BY_USER=false
 CACHE_SET_BY_USER=false
 QB_EXPLICIT_CACHE_MODE=false
 TUNE_MODE="1"
@@ -68,6 +74,12 @@ ACTION="install"
 
 HB="/root"
 ASP_ENV_FILE="/etc/asp_env.sh"
+
+# 第二实例 qBittorrent（可选，QB_COUNT=2 时启用）
+QB2_SERVICE_NAME="qbittorrent-nox-2"
+QB2_UNIT_PATH="/etc/systemd/system/${QB2_SERVICE_NAME}.service"
+QB2_CONFIG_BASE="${HB}/.config/qbittorrent-2"
+QB2_DATA_BASE="${HB}/.local/share/qbittorrent-2"
 
 TEMP_DIR=$(mktemp -d -t asp-XXXXXX)
 trap 'rm -rf "$TEMP_DIR"' EXIT
@@ -158,6 +170,7 @@ download_file() {
 
     if [[ "$output" == "/usr/bin/qbittorrent-nox" ]]; then
         systemctl stop "qbittorrent-nox@$APP_USER" 2>/dev/null || true
+        systemctl stop "$QB2_SERVICE_NAME" 2>/dev/null || true
         pkill -9 qbittorrent-nox 2>/dev/null || true
         rm -f "$output" 2>/dev/null || true
     fi
@@ -207,6 +220,11 @@ configure_firewall_policy() {
     register_firewall_rule "$QB_WEB_PORT" tcp
     register_firewall_rule "$QB_BT_PORT" tcp
     register_firewall_rule "$QB_BT_PORT" udp
+    if [[ "$QB_COUNT" -ge 2 ]]; then
+        register_firewall_rule "$QB2_WEB_PORT" tcp
+        register_firewall_rule "$QB2_BT_PORT" tcp
+        register_firewall_rule "$QB2_BT_PORT" udp
+    fi
     [[ "$DO_VX" == "true" ]] && register_firewall_rule "$VX_PORT" tcp
     [[ "$DO_FB" == "true" ]] && register_firewall_rule "$FB_PORT" tcp
 
@@ -413,8 +431,8 @@ choose_default_qb_cache() {
 }
 
 qb_api_wait_ready() {
-    local attempts="${1:-40}" delay="${2:-2}" i base
-    base="http://127.0.0.1:${QB_WEB_PORT}"
+    local attempts="${1:-40}" delay="${2:-2}" port="${3:-$QB_WEB_PORT}" i base
+    base="http://127.0.0.1:${port}"
     for ((i=1; i<=attempts; i++)); do
         if curl -fsS --max-time 2 \
             -H "Referer: ${base}" -H "Origin: ${base}" \
@@ -427,8 +445,8 @@ qb_api_wait_ready() {
 }
 
 qb_api_login() {
-    local cookie_file="$1" attempt response base
-    base="http://127.0.0.1:${QB_WEB_PORT}"
+    local cookie_file="$1" port="${2:-$QB_WEB_PORT}" attempt response base
+    base="http://127.0.0.1:${port}"
     rm -f "$cookie_file" 2>/dev/null || true
     for attempt in 1 2 3; do
         response=$(curl -fsS -c "$cookie_file" --max-time 6 \
@@ -445,16 +463,16 @@ qb_api_login() {
 }
 
 qb_api_get_preferences() {
-    local cookie_file="$1" output_file="$2" base
-    base="http://127.0.0.1:${QB_WEB_PORT}"
+    local cookie_file="$1" output_file="$2" port="${3:-$QB_WEB_PORT}" base
+    base="http://127.0.0.1:${port}"
     curl -fsS -b "$cookie_file" --max-time 8 \
         -H "Referer: ${base}" -H "Origin: ${base}" \
         "${base}/api/v2/app/preferences" > "$output_file"
 }
 
 qb_api_set_preferences() {
-    local cookie_file="$1" payload_file="$2" code base
-    base="http://127.0.0.1:${QB_WEB_PORT}"
+    local cookie_file="$1" payload_file="$2" port="${3:-$QB_WEB_PORT}" code base
+    base="http://127.0.0.1:${port}"
     code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 8 \
         -b "$cookie_file" \
         -H "Referer: ${base}" -H "Origin: ${base}" \
@@ -465,16 +483,17 @@ qb_api_set_preferences() {
 
 qb_api_apply_preferences() {
     local patch_file="$1"
-    local cookie_file="$TEMP_DIR/qb_cookie.txt"
-    local current_pref="$TEMP_DIR/qb_current_pref.json"
-    local final_pref="$TEMP_DIR/qb_final_pref.json"
+    local port="${2:-$QB_WEB_PORT}"
+    local cookie_file="$TEMP_DIR/qb_cookie_${port}.txt"
+    local current_pref="$TEMP_DIR/qb_current_pref_${port}.json"
+    local final_pref="$TEMP_DIR/qb_final_pref_${port}.json"
     local attempt count
 
-    qb_api_wait_ready 40 2 || return 1
+    qb_api_wait_ready 40 2 "$port" || return 1
 
     for attempt in 1 2 3; do
-        qb_api_login "$cookie_file" || { sleep "$attempt"; continue; }
-        qb_api_get_preferences "$cookie_file" "$current_pref" || { sleep "$attempt"; continue; }
+        qb_api_login "$cookie_file" "$port" || { sleep "$attempt"; continue; }
+        qb_api_get_preferences "$cookie_file" "$current_pref" "$port" || { sleep "$attempt"; continue; }
 
         # patch first, current second: keep only patch keys supported by this qB build.
         if ! jq -s '
@@ -492,7 +511,7 @@ qb_api_apply_preferences() {
             return 0
         fi
 
-        if qb_api_set_preferences "$cookie_file" "$final_pref"; then
+        if qb_api_set_preferences "$cookie_file" "$final_pref" "$port"; then
             return 0
         fi
         sleep "$attempt"
@@ -606,6 +625,9 @@ uninstall() {
             systemctl disable \"\$svc\" 2>/dev/null || true
         done
 
+        systemctl stop ${QB2_SERVICE_NAME} 2>/dev/null || true
+        systemctl disable ${QB2_SERVICE_NAME} 2>/dev/null || true
+
         systemctl stop asp-qb-autotune.timer 2>/dev/null || true
         systemctl stop asp-qb-autotune.service 2>/dev/null || true
         systemctl disable asp-qb-autotune.timer 2>/dev/null || true
@@ -627,6 +649,10 @@ uninstall() {
 
         rm -f /etc/systemd/system/qbittorrent-nox@.service
         rm -f /etc/systemd/system/multi-user.target.wants/qbittorrent-nox@*.service 2>/dev/null || true
+
+        rm -f ${QB2_UNIT_PATH}
+        rm -f /etc/systemd/system/multi-user.target.wants/${QB2_SERVICE_NAME}.service 2>/dev/null || true
+        rm -rf \"${target_home}/.config/qbittorrent-2\" \"${target_home}/.local/share/qbittorrent-2\"
 
         rm -f \"$AUTOTUNE_BIN\" \"$AUTOTUNE_SVC\" \"$AUTOTUNE_TMR\" \"$AUTOTUNE_ENV\"
         rm -f \"$AUTOTUNE_STATE\" \"$AUTOTUNE_COOKIE\" \"$AUTOTUNE_LOCK\" \"$AUTOTUNE_PSI_WARN\"
@@ -709,6 +735,9 @@ uninstall() {
             ufw delete allow $QB_WEB_PORT/tcp >/dev/null 2>&1 || true
             ufw delete allow $QB_BT_PORT/tcp >/dev/null 2>&1 || true
             ufw delete allow $QB_BT_PORT/udp >/dev/null 2>&1 || true
+            ufw delete allow $QB2_WEB_PORT/tcp >/dev/null 2>&1 || true
+            ufw delete allow $QB2_BT_PORT/tcp >/dev/null 2>&1 || true
+            ufw delete allow $QB2_BT_PORT/udp >/dev/null 2>&1 || true
             ufw delete allow $VX_PORT/tcp >/dev/null 2>&1 || true
             ufw delete allow $FB_PORT/tcp >/dev/null 2>&1 || true
         fi
@@ -716,6 +745,9 @@ uninstall() {
             firewall-cmd --zone=public --remove-port=\"$QB_WEB_PORT/tcp\" --permanent >/dev/null 2>&1 || true
             firewall-cmd --zone=public --remove-port=\"$QB_BT_PORT/tcp\" --permanent >/dev/null 2>&1 || true
             firewall-cmd --zone=public --remove-port=\"$QB_BT_PORT/udp\" --permanent >/dev/null 2>&1 || true
+            firewall-cmd --zone=public --remove-port=\"$QB2_WEB_PORT/tcp\" --permanent >/dev/null 2>&1 || true
+            firewall-cmd --zone=public --remove-port=\"$QB2_BT_PORT/tcp\" --permanent >/dev/null 2>&1 || true
+            firewall-cmd --zone=public --remove-port=\"$QB2_BT_PORT/udp\" --permanent >/dev/null 2>&1 || true
             firewall-cmd --zone=public --remove-port=\"$VX_PORT/tcp\" --permanent >/dev/null 2>&1 || true
             firewall-cmd --zone=public --remove-port=\"$FB_PORT/tcp\" --permanent >/dev/null 2>&1 || true
             firewall-cmd --reload >/dev/null 2>&1 || true
@@ -724,6 +756,9 @@ uninstall() {
             iptables -D INPUT -p tcp --dport $QB_WEB_PORT -j ACCEPT 2>/dev/null || true
             iptables -D INPUT -p tcp --dport $QB_BT_PORT -j ACCEPT 2>/dev/null || true
             iptables -D INPUT -p udp --dport $QB_BT_PORT -j ACCEPT 2>/dev/null || true
+            iptables -D INPUT -p tcp --dport $QB2_WEB_PORT -j ACCEPT 2>/dev/null || true
+            iptables -D INPUT -p tcp --dport $QB2_BT_PORT -j ACCEPT 2>/dev/null || true
+            iptables -D INPUT -p udp --dport $QB2_BT_PORT -j ACCEPT 2>/dev/null || true
             iptables -D INPUT -p tcp --dport $VX_PORT -j ACCEPT 2>/dev/null || true
             iptables -D INPUT -p tcp --dport $FB_PORT -j ACCEPT 2>/dev/null || true
             if command -v netfilter-persistent >/dev/null; then
@@ -1321,77 +1356,8 @@ EOF
 
 # ================= 5. 应用部署 =================
 
-install_qbit() {
-    echo ""
-    echo -e " ${CYAN}╔══════════════════ 部署 qBittorrent 引擎 ══════════════════╗${NC}"
-    echo ""
-
-    local arch qb_arch upstream_arch url api url_var
-    arch=$(uname -m)
-    qb_arch=$(get_qb_arch)
-    upstream_arch=$(get_upstream_arch "$qb_arch")
-    if [[ -z "$qb_arch" ]]; then
-        log_err "不支持的 CPU 架构: $arch（仅支持 x86_64 / aarch64 / armv7l）"
-    fi
-    url=""
-    api="https://api.github.com/repos/userdocs/qbittorrent-nox-static/releases"
-
-    local hash_threads total_mem_mb disk_class cache_val config_file pass_hash patch_file service_extra
-    hash_threads=$(nproc 2>/dev/null || echo 2)
-
-    if [[ "$QB_VER_REQ" == "4" || "$QB_VER_REQ" == "4.3.9" ]]; then
-        INSTALLED_MAJOR_VER="4"
-        log_info "锁定版本: 4.x -> 使用个人静态库"
-        url_var="URL_V4_${qb_arch}"
-        url="${!url_var}"
-    elif [[ "$QB_VER_REQ" == "5" || "$QB_VER_REQ" == "5.0.4" ]]; then
-        INSTALLED_MAJOR_VER="5"
-        log_info "锁定版本: 5.x -> 使用个人静态库"
-        url_var="URL_V5_${qb_arch}"
-        url="${!url_var}"
-    else
-        INSTALLED_MAJOR_VER="5"
-        log_info "请求动态版本: $QB_VER_REQ -> GitHub API"
-
-        local tag=""
-        if [[ "$QB_VER_REQ" == "latest" ]]; then
-            tag=$(curl -sL --max-time 10 "$api" | jq -r '.[0].tag_name' 2>/dev/null || echo "null")
-        else
-            tag=$(curl -sL --max-time 10 "$api" | jq -r --arg v "$QB_VER_REQ" '.[].tag_name | select(contains($v))' 2>/dev/null | head -n 1 || echo "null")
-        fi
-
-        if [[ -z "$tag" || "$tag" == "null" ]]; then
-            log_warn "GitHub API 获取失败，降级为内置版本 5.0.4"
-            url_var="URL_V5_${qb_arch}"
-            url="${!url_var}"
-        else
-            log_info "获取上游版本: $tag"
-            local fname="${upstream_arch}-qbittorrent-nox"
-            url="https://github.com/userdocs/qbittorrent-nox-static/releases/download/${tag}/${fname}"
-        fi
-    fi
-
-    download_file "$url" "/usr/bin/qbittorrent-nox"
-    chmod +x /usr/bin/qbittorrent-nox
-
-    mkdir -p "$HB/.config/qBittorrent" "$HB/Downloads" "$HB/.local/share/qBittorrent/BT_backup"
-    chown -R "$APP_USER:$APP_USER" "$HB/.config/qBittorrent" "$HB/Downloads" "$HB/.local"
-
-    rm -f "$HB/.config/qBittorrent/qBittorrent.conf.lock"
-    rm -f "$HB/.local/share/qBittorrent/BT_backup/.lock"
-
-    pass_hash=$(python3 -c "import sys, base64, hashlib, os; salt = os.urandom(16); dk = hashlib.pbkdf2_hmac('sha512', sys.argv[1].encode(), salt, 100000); print(f'@ByteArray({base64.b64encode(salt).decode()}:{base64.b64encode(dk).decode()})')" "$APP_PASS")
-
-    disk_class=$(detect_download_disk_class "$HB/Downloads")
-    total_mem_mb=$(get_total_mem_mb)
-    detect_qb_profile "$disk_class" "$total_mem_mb"
-
-    if [[ "${CACHE_SET_BY_USER:-false}" == "false" ]]; then
-        QB_CACHE=$(choose_default_qb_cache "$total_mem_mb" "$TUNE_MODE")
-    fi
-
-    cache_val="$QB_CACHE"
-    config_file="$HB/.config/qBittorrent/qBittorrent.conf"
+qb_write_config() {
+    local config_file="$1" web_port="$2" bt_port="$3" pass_hash="$4" cache_val="$5" hash_threads="$6"
 
     cat > "$config_file" << EOF
 [LegalNotice]
@@ -1403,7 +1369,7 @@ WebUI\Locale=zh_CN
 WebUI\Language=zh_CN
 Downloads\SavePath=$HB/Downloads/
 WebUI\Password_PBKDF2="$pass_hash"
-WebUI\Port=$QB_WEB_PORT
+WebUI\Port=$web_port
 WebUI\Username=$APP_USER
 WebUI\AuthSubnetWhitelist=127.0.0.1/32, 172.16.0.0/12, 10.0.0.0/8, 192.168.0.0/16, 172.17.0.0/16
 WebUI\AuthSubnetWhitelistEnabled=true
@@ -1411,7 +1377,7 @@ WebUI\LocalHostAuthenticationEnabled=false
 WebUI\HostHeaderValidation=false
 WebUI\CSRFProtection=false
 WebUI\HTTPS\Enabled=false
-Connection\PortRangeMin=$QB_BT_PORT
+Connection\PortRangeMin=$bt_port
 EOF
 
     if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then
@@ -1431,25 +1397,25 @@ Session\SendBufferWatermark=${QB_PROFILE_BUFFER}
 Session\SendBufferWatermarkFactor=${QB_PROFILE_FACTOR}
 EOF
     fi
+}
 
-    chown "$APP_USER:$APP_USER" "$config_file"
-
-    service_extra=""
-    if [[ "$TUNE_MODE" == "2" && $total_mem_mb -le 8192 ]]; then
-        local memory_high_mb
-        memory_high_mb=$(( total_mem_mb * 75 / 100 ))
-        service_extra=$'\nMemoryAccounting=true\nMemoryHigh='"${memory_high_mb}"$'M'
+qb_write_service_unit() {
+    local svc_path="$1" inst="$2" web_port="$3" web_user="$4" xdg_config="$5" xdg_data="$6" service_extra="$7"
+    local desc="qBittorrent Service (User: ${web_user})" env_block=""
+    if [[ "$inst" -ge 2 ]]; then
+        desc="qBittorrent Service #${inst} (User: ${web_user})"
+        env_block=$'Environment="XDG_CONFIG_HOME='"${xdg_config}"$'"\nEnvironment="XDG_DATA_HOME='"${xdg_data}"$'"\n'
     fi
 
-    cat > /etc/systemd/system/qbittorrent-nox@.service << EOF
+    cat > "$svc_path" << EOF
 [Unit]
-Description=qBittorrent Service (User: %i)
+Description=$desc
 After=network.target
 
 [Service]
 Type=simple
-User=%i
-ExecStart=/usr/bin/qbittorrent-nox --webui-port=$QB_WEB_PORT
+User=$web_user
+${env_block}ExecStart=/usr/bin/qbittorrent-nox --webui-port=$web_port
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=20
@@ -1460,15 +1426,12 @@ OOMScoreAdjust=0${service_extra}
 [Install]
 WantedBy=multi-user.target
 EOF
+}
 
-    systemctl daemon-reload && systemctl enable "qbittorrent-nox@$APP_USER" >/dev/null 2>&1
-    systemctl restart "qbittorrent-nox@$APP_USER"
-    open_port "$QB_WEB_PORT"
-    open_port "$QB_BT_PORT" "tcp"
-    open_port "$QB_BT_PORT" "udp"
+qb_write_patch_file() {
+    local out="$1" cache_val="$2" hash_threads="$3" total_mem_mb="$4"
 
-    patch_file="$TEMP_DIR/patch_pref.json"
-    python3 - "$patch_file" "$INSTALLED_MAJOR_VER" "$TUNE_MODE" "$cache_val" "$hash_threads" \
+    python3 - "$out" "$INSTALLED_MAJOR_VER" "$TUNE_MODE" "$cache_val" "$hash_threads" \
         "$QB_PROFILE_AIO" "$QB_PROFILE_LOW_BUFFER" "$QB_PROFILE_BUFFER" "$QB_PROFILE_FACTOR" \
         "$QB_PROFILE_IO_MODE" "$total_mem_mb" << 'PY'
 import json, sys
@@ -1552,15 +1515,146 @@ else:
 with open(out, 'w', encoding='utf-8') as f:
     json.dump(patch, f, separators=(",",":"))
 PY
+}
 
-    if qb_api_apply_preferences "$patch_file"; then
-        echo -e " ${GREEN}[√]${NC} 引擎配置下发完成。"
-        systemctl restart "qbittorrent-nox@$APP_USER"
+qb_setup_instance() {
+    local inst="$1" web_port="$2" bt_port="$3" cfg_base="$4" data_base="$5"
+    local config_file="$cfg_base/qBittorrent/qBittorrent.conf"
+    local pass_hash service_file service_unit
+
+    if [[ "$inst" -ge 2 ]]; then
+        service_file="$QB2_UNIT_PATH"
+        service_unit="$QB2_SERVICE_NAME"
     else
-        echo -e " ${RED}[X]${NC} API 注入失败，多次重试后仍未成功，请检查 WebUI/日志。"
+        service_file="/etc/systemd/system/qbittorrent-nox@.service"
+        service_unit="qbittorrent-nox@$APP_USER"
+    fi
+    systemctl stop "$service_unit" 2>/dev/null || true
+
+    mkdir -p "$cfg_base/qBittorrent" "$data_base/qBittorrent/BT_backup"
+    rm -f "$cfg_base/qBittorrent/qBittorrent.conf.lock"
+    rm -f "$data_base/qBittorrent/BT_backup/.lock"
+    chown -R "$APP_USER:$APP_USER" "$cfg_base" "$data_base" 2>/dev/null || true
+
+    pass_hash=$(python3 -c "import sys, base64, hashlib, os; salt = os.urandom(16); dk = hashlib.pbkdf2_hmac('sha512', sys.argv[1].encode(), salt, 100000); print(f'@ByteArray({base64.b64encode(salt).decode()}:{base64.b64encode(dk).decode()})')" "$APP_PASS")
+    qb_write_config "$config_file" "$web_port" "$bt_port" "$pass_hash" "$QB_CACHE" "$QB_HASH_THREADS"
+    chown "$APP_USER:$APP_USER" "$config_file"
+
+    if [[ "$inst" -ge 2 ]]; then
+        qb_write_service_unit "$service_file" "$inst" "$web_port" "$APP_USER" "$cfg_base" "$data_base" "$QB_SERVICE_EXTRA"
+    else
+        qb_write_service_unit "$service_file" "$inst" "$web_port" "%i" "" "" "$QB_SERVICE_EXTRA"
     fi
 
+    systemctl daemon-reload
+    systemctl enable "$service_unit" >/dev/null 2>&1 || true
+    systemctl restart "$service_unit"
+    open_port "$web_port"
+    open_port "$bt_port" "tcp"
+    open_port "$bt_port" "udp"
+
+    local patch_file="$TEMP_DIR/patch_pref_${inst}.json"
+    qb_write_patch_file "$patch_file" "$QB_CACHE" "$QB_HASH_THREADS" "$QB_TOTAL_MEM_MB"
+    if qb_api_apply_preferences "$patch_file" "$web_port"; then
+        echo -e " ${GREEN}[√]${NC} 引擎 #${inst} 配置下发完成。"
+        systemctl restart "$service_unit"
+    else
+        echo -e " ${RED}[X]${NC} 引擎 #${inst} API 注入失败，多次重试后仍未成功，请检查 WebUI/日志。"
+    fi
     rm -f "$patch_file"
+}
+
+install_qbit() {
+    echo ""
+    echo -e " ${CYAN}╔══════════════════ 部署 qBittorrent 引擎 ══════════════════╗${NC}"
+    echo ""
+
+    local arch qb_arch upstream_arch url api url_var
+    arch=$(uname -m)
+    qb_arch=$(get_qb_arch)
+    upstream_arch=$(get_upstream_arch "$qb_arch")
+    if [[ -z "$qb_arch" ]]; then
+        log_err "不支持的 CPU 架构: $arch（仅支持 x86_64 / aarch64 / armv7l）"
+    fi
+    url=""
+    api="https://api.github.com/repos/userdocs/qbittorrent-nox-static/releases"
+
+    local total_mem_mb disk_class
+
+    if [[ "$QB_VER_REQ" == "4" || "$QB_VER_REQ" == "4.3.9" ]]; then
+        INSTALLED_MAJOR_VER="4"
+        log_info "锁定版本: 4.x -> 使用个人静态库"
+        url_var="URL_V4_${qb_arch}"
+        url="${!url_var}"
+    elif [[ "$QB_VER_REQ" == "5" || "$QB_VER_REQ" == "5.0.4" ]]; then
+        INSTALLED_MAJOR_VER="5"
+        log_info "锁定版本: 5.x -> 使用个人静态库"
+        url_var="URL_V5_${qb_arch}"
+        url="${!url_var}"
+    else
+        INSTALLED_MAJOR_VER="5"
+        log_info "请求动态版本: $QB_VER_REQ -> GitHub API"
+
+        local tag=""
+        if [[ "$QB_VER_REQ" == "latest" ]]; then
+            tag=$(curl -sL --max-time 10 "$api" | jq -r '.[0].tag_name' 2>/dev/null || echo "null")
+        else
+            tag=$(curl -sL --max-time 10 "$api" | jq -r --arg v "$QB_VER_REQ" '.[].tag_name | select(contains($v))' 2>/dev/null | head -n 1 || echo "null")
+        fi
+
+        if [[ -z "$tag" || "$tag" == "null" ]]; then
+            log_warn "GitHub API 获取失败，降级为内置版本 5.0.4"
+            url_var="URL_V5_${qb_arch}"
+            url="${!url_var}"
+        else
+            log_info "获取上游版本: $tag"
+            local fname="${upstream_arch}-qbittorrent-nox"
+            url="https://github.com/userdocs/qbittorrent-nox-static/releases/download/${tag}/${fname}"
+        fi
+    fi
+
+    download_file "$url" "/usr/bin/qbittorrent-nox"
+    chmod +x /usr/bin/qbittorrent-nox
+
+    mkdir -p "$HB/.config/qBittorrent" "$HB/Downloads" "$HB/.local/share/qBittorrent/BT_backup"
+    chown -R "$APP_USER:$APP_USER" "$HB/.config/qBittorrent" "$HB/Downloads" "$HB/.local"
+
+    rm -f "$HB/.config/qBittorrent/qBittorrent.conf.lock"
+    rm -f "$HB/.local/share/qBittorrent/BT_backup/.lock"
+
+    QB2_CONFIG_BASE="$HB/.config/qbittorrent-2"
+    QB2_DATA_BASE="$HB/.local/share/qbittorrent-2"
+
+    QB_HASH_THREADS=$(nproc 2>/dev/null || echo 2)
+    disk_class=$(detect_download_disk_class "$HB/Downloads")
+    total_mem_mb=$(get_total_mem_mb)
+    detect_qb_profile "$disk_class" "$total_mem_mb"
+    QB_TOTAL_MEM_MB="$total_mem_mb"
+
+    if [[ "${CACHE_SET_BY_USER:-false}" == "false" ]]; then
+        QB_CACHE=$(choose_default_qb_cache "$total_mem_mb" "$TUNE_MODE")
+        if [[ "$QB_COUNT" -ge 2 ]]; then
+            QB_CACHE=$(( QB_CACHE / 2 ))
+            if (( QB_CACHE < 256 )); then QB_CACHE=256; fi
+            log_info "双实例模式：自动缓存按实例均分，每实例 ${QB_CACHE} MiB。"
+        fi
+    elif [[ "$QB_COUNT" -ge 2 ]]; then
+        log_info "双实例模式：-c 指定的 ${QB_CACHE} MiB 将分别应用于两个实例。"
+    fi
+
+    QB_SERVICE_EXTRA=""
+    if [[ "$TUNE_MODE" == "2" && $total_mem_mb -le 8192 ]]; then
+        local memory_high_mb
+        memory_high_mb=$(( total_mem_mb * 75 / 100 ))
+        QB_SERVICE_EXTRA=$'\nMemoryAccounting=true\nMemoryHigh='"${memory_high_mb}"$'M'
+    fi
+
+    qb_setup_instance 1 "$QB_WEB_PORT" "$QB_BT_PORT" "$HB/.config" "$HB/.local/share"
+
+    if [[ "$QB_COUNT" -ge 2 ]]; then
+        echo -e " ${CYAN}▶ 正在部署第二实例 qBittorrent (#2)...${NC}"
+        qb_setup_instance 2 "$QB2_WEB_PORT" "$QB2_BT_PORT" "$QB2_CONFIG_BASE" "$QB2_DATA_BASE"
+    fi
 }
 
 create_filebrowser_admin() {
@@ -2209,6 +2303,14 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         -q|--qbit) QB_VER_REQ="$2"; shift 2 ;;
+        -Q|--qb-count)
+            QB_COUNT="$2"
+            if [[ "$QB_COUNT" != "1" && "$QB_COUNT" != "2" ]]; then
+                log_err "参数 -Q/--qb-count 只能是 1 或 2。"
+            fi
+            QB_COUNT_SET_BY_USER=true
+            shift 2
+            ;;
         -m|--mode) TUNE_MODE="$2"; shift 2 ;;
         -v|--vertex) DO_VX=true; shift ;;
         -f|--filebrowser) DO_FB=true; shift ;;
@@ -2332,6 +2434,20 @@ if [[ -z "$APP_PASS" ]]; then
     echo ""
 fi
 
+if [[ "$QB_COUNT_SET_BY_USER" != "true" ]] && is_interactive_mode; then
+    echo -e " ${CYAN}╔══════════════════ qBittorrent 实例数 ════════════════╗${NC}"
+    echo "  1) 安装 1 个 qBittorrent（默认）"
+    echo "  2) 安装 2 个 qBittorrent（独立配置与 BT_backup，共用 Downloads）"
+    local_qb_count=""
+    read -r -p "  ▶ 请选择 [默认 1]: " local_qb_count < /dev/tty || true
+    case "${local_qb_count:-1}" in
+        2) QB_COUNT=2 ;;
+        *) QB_COUNT=1 ;;
+    esac
+    echo ""
+    unset local_qb_count
+fi
+
 export DEBIAN_FRONTEND=noninteractive
 execute_with_spinner "修复系统包状态" sh -c "dpkg --configure -a && apt-get --fix-broken install -y >/dev/null 2>&1 || true"
 execute_with_spinner "安装依赖 (curl/jq/python3...)" sh -c "apt-get -qq update && apt-get -qq install -y curl wget jq unzip tar python3 net-tools ethtool iptables mediainfo ffmpeg locales"
@@ -2341,8 +2457,32 @@ if [[ "$CUSTOM_PORT" == "true" ]]; then
     echo ""
     QB_WEB_PORT=$(get_input_port "qBit WebUI" 8080)
     QB_BT_PORT=$(get_input_port "qBit BT监听" 47878)
+    if [[ "$QB_COUNT" -ge 2 ]]; then
+        QB2_WEB_PORT=$(get_input_port "第二 qBit WebUI" 8880)
+        QB2_BT_PORT=$(get_input_port "第二 qBit BT监听" 47879)
+    fi
     [[ "$DO_VX" == "true" ]] && VX_PORT=$(get_input_port "Vertex" 3000)
     [[ "$DO_FB" == "true" ]] && FB_PORT=$(get_input_port "FileBrowser" 8081)
+fi
+
+if [[ "$QB_COUNT" -ge 2 ]]; then
+    if [[ "$CUSTOM_PORT" != "true" ]]; then
+        if check_port_occupied "$QB2_WEB_PORT"; then
+            log_err "第二 qBit 默认 WebUI 端口 ${QB2_WEB_PORT} 已被占用，请改用 -o。"
+        fi
+        if check_port_occupied "$QB2_BT_PORT"; then
+            log_err "第二 qBit 默认 BT 端口 ${QB2_BT_PORT} 已被占用，请改用 -o。"
+        fi
+    fi
+    if [[ "$QB2_WEB_PORT" == "$QB_WEB_PORT" || "$QB2_BT_PORT" == "$QB_BT_PORT" || "$QB2_WEB_PORT" == "$QB2_BT_PORT" ]]; then
+        log_err "两个 qBittorrent 实例的端口不能重复。"
+    fi
+    if [[ "$DO_VX" == "true" ]] && [[ "$QB2_WEB_PORT" == "$VX_PORT" || "$QB2_BT_PORT" == "$VX_PORT" ]]; then
+        log_err "第二 qBit 端口与 Vertex 端口冲突。"
+    fi
+    if [[ "$DO_FB" == "true" ]] && [[ "$QB2_WEB_PORT" == "$FB_PORT" || "$QB2_BT_PORT" == "$FB_PORT" ]]; then
+        log_err "第二 qBit 端口与 FileBrowser 端口冲突。"
+    fi
 fi
 
 while check_port_occupied "$MI_PORT"; do
@@ -2351,11 +2491,24 @@ done
 while check_port_occupied "$SS_PORT"; do
     SS_PORT=$((SS_PORT + 1))
 done
+if [[ "$QB_COUNT" -ge 2 ]]; then
+    while [[ "$MI_PORT" == "$QB2_WEB_PORT" || "$MI_PORT" == "$QB2_BT_PORT" ]]; do
+        MI_PORT=$((MI_PORT + 1))
+        while check_port_occupied "$MI_PORT"; do MI_PORT=$((MI_PORT + 1)); done
+    done
+    while [[ "$SS_PORT" == "$QB2_WEB_PORT" || "$SS_PORT" == "$QB2_BT_PORT" ]]; do
+        SS_PORT=$((SS_PORT + 1))
+        while check_port_occupied "$SS_PORT"; do SS_PORT=$((SS_PORT + 1)); done
+    done
+fi
 
 
 cat > "$ASP_ENV_FILE" << EOF
+export QB_COUNT=$QB_COUNT
 export QB_WEB_PORT=$QB_WEB_PORT
 export QB_BT_PORT=$QB_BT_PORT
+export QB2_WEB_PORT=$QB2_WEB_PORT
+export QB2_BT_PORT=$QB2_BT_PORT
 export VX_PORT=${VX_PORT:-3000}
 export FB_PORT=${FB_PORT:-8081}
 export MI_PORT=${MI_PORT:-8082}
@@ -2453,6 +2606,9 @@ if [[ "$INSTALLED_MAJOR_VER" == "5" ]]; then
     echo -e "  ${YELLOW}提示: 若首次看到种子为 0，可 Ctrl+F5 强制刷新${NC}"
 fi
 echo -e "  🧩 qBittorrent WebUI : ${GREEN}http://$PUB_IP:$QB_WEB_PORT${NC}"
+if [[ "$QB_COUNT" -ge 2 ]]; then
+echo -e "  🧩 qBittorrent #2    : ${GREEN}http://$PUB_IP:$QB2_WEB_PORT${NC}"
+fi
 if [[ "$DO_VX" == "true" ]]; then
 echo -e "  🌐 Vertex 面板      : ${GREEN}http://$PUB_IP:$VX_PORT${NC}"
 echo -e "     └─ 内部直连 qBit : ${YELLOW}$VX_GW:$QB_WEB_PORT${NC}"
@@ -2468,16 +2624,25 @@ echo -e " ------------------------ ${CYAN}🔐 登录信息${NC} ---------------
 echo -e "  👤 账号 : ${YELLOW}$APP_USER${NC}"
 echo -e "  🔑 密码 : ${YELLOW}$APP_PASS${NC}"
 echo -e "  📡 BT 端口 : ${YELLOW}$QB_BT_PORT${NC} (TCP/UDP)"
+if [[ "$QB_COUNT" -ge 2 ]]; then
+echo -e "  📡 BT 端口 #2 : ${YELLOW}$QB2_BT_PORT${NC} (TCP/UDP)"
+fi
 
 echo ""
 echo -e " ------------------------ ${CYAN}📂 数据目录${NC} ------------------------"
 echo -e "  ⬇️ Downloads : $HB/Downloads"
 echo -e "  ⚙️ qB 配置   : $HB/.config/qBittorrent"
+if [[ "$QB_COUNT" -ge 2 ]]; then
+echo -e "  ⚙️ qB #2 配置 : $HB/.config/qbittorrent-2"
+fi
 [[ "$DO_VX" == "true" ]] && echo -e "  📦 Vertex 数据: $HB/vertex/data"
 
 echo ""
 echo -e " ------------------------ ${CYAN}🛠️ 维护指令${NC} ------------------------"
 echo -e "  重启 qB : ${YELLOW}systemctl restart qbittorrent-nox@$APP_USER${NC}"
+if [[ "$QB_COUNT" -ge 2 ]]; then
+echo -e "  重启 qB #2 : ${YELLOW}systemctl restart ${QB2_SERVICE_NAME}${NC}"
+fi
 echo -e "  动态控制器说明: 需要 ${YELLOW}-a${NC} opt-in 才会启用；PSI 可用时联动 PSI，不可用时自动回退为 MemAvailable-only。"
 if [[ "$TUNE_MODE" == "1" && "$AUTOTUNE_ENABLE" == "true" ]]; then
 echo -e "  动态控制器 : ${YELLOW}systemctl status asp-qb-autotune.timer${NC}"
